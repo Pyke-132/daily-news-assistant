@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import feedparser
 import requests
@@ -49,6 +51,53 @@ class NewsItem:
     published: str = ""
 
 
+@dataclass
+class ReportItem:
+    title: str
+    source: str
+    url: str
+    published: str
+    relevance_score: float
+    link_status: str
+    content_status: str
+    front_context: str
+    why_recommend: str
+    why_not_recommend: str
+    one_sentence: str
+    original_facts: list[str]
+    model_summary: list[str]
+    related_thoughts: list[str]
+    action: str
+    matched_keywords: list[str]
+
+
+@dataclass
+class RunReport:
+    schema_version: int
+    report_type: str
+    report_date: str
+    generated_at: str
+    status: str
+    candidate_count: int
+    items: list[ReportItem]
+    optional_references: list[ReportItem]
+    low_value_reason: str = ""
+    error_stage: str = ""
+    error_message: str = ""
+
+
+@dataclass
+class DailyReport:
+    schema_version: int
+    report_type: str
+    report_date: str
+    updated_at: str
+    items: list[ReportItem]
+
+
+SCHEMA_VERSION = 1
+RUN_STATUSES = {"formal", "low_value", "failed"}
+TRACKING_QUERY_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
 INVALID_STATUS_CODES = {404, 410, 500, 502, 503, 504}
 MIN_CONTENT_LENGTH = 500
 MIN_ADJUSTED_SCORE = 1
@@ -473,6 +522,487 @@ def filter_llm_candidates(candidates: list[NewsItem]) -> list[NewsItem]:
     return llm_candidates
 
 
+def local_timestamp() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def parse_llm_json(raw: str) -> dict[str, Any]:
+    text = raw.strip()
+    if text.startswith("```") and text.endswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3 and lines[0].strip().lower() in {"```", "```json"} and lines[-1].strip() == "```":
+            text = "\n".join(lines[1:-1]).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"LLM returned malformed JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("LLM JSON must be an object.")
+    return data
+
+
+def require_field(data: dict[str, Any], field_name: str) -> Any:
+    if field_name not in data:
+        raise ValueError(f"Missing required field: {field_name}")
+    return data[field_name]
+
+
+def require_string(data: dict[str, Any], field_name: str, allow_empty: bool = False) -> str:
+    value = require_field(data, field_name)
+    if not isinstance(value, str):
+        raise ValueError(f"Field {field_name} must be a string.")
+    if not allow_empty and not value.strip():
+        raise ValueError(f"Field {field_name} must not be empty.")
+    return value.strip()
+
+
+def require_string_list(data: dict[str, Any], field_name: str) -> list[str]:
+    value = require_field(data, field_name)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"Field {field_name} must be a list of strings.")
+    return [item.strip() for item in value if item.strip()]
+
+
+def require_item_list(data: dict[str, Any], field_name: str) -> list[dict[str, Any]]:
+    value = require_field(data, field_name)
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError(f"Field {field_name} must be a list of objects.")
+    return value
+
+
+def looks_like_http_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def report_item_from_dict(data: dict[str, Any]) -> ReportItem:
+    if not isinstance(data, dict):
+        raise ValueError("Report item must be an object.")
+    score = require_field(data, "relevance_score")
+    if not isinstance(score, (int, float)) or isinstance(score, bool):
+        raise ValueError("Field relevance_score must be a number.")
+    score_float = float(score)
+    if not 1 <= score_float <= 10:
+        raise ValueError("Field relevance_score must be between 1 and 10.")
+
+    url = require_string(data, "url")
+    if not looks_like_http_url(url):
+        raise ValueError(f"Report item URL must be http/https: {url}")
+
+    return ReportItem(
+        title=require_string(data, "title"),
+        source=require_string(data, "source"),
+        url=url,
+        published=require_string(data, "published", allow_empty=True),
+        relevance_score=score_float,
+        link_status=require_string(data, "link_status"),
+        content_status=require_string(data, "content_status"),
+        front_context=require_string(data, "front_context"),
+        why_recommend=require_string(data, "why_recommend"),
+        why_not_recommend=require_string(data, "why_not_recommend"),
+        one_sentence=require_string(data, "one_sentence"),
+        original_facts=require_string_list(data, "original_facts"),
+        model_summary=require_string_list(data, "model_summary"),
+        related_thoughts=require_string_list(data, "related_thoughts"),
+        action=require_string(data, "action"),
+        matched_keywords=require_string_list(data, "matched_keywords"),
+    )
+
+
+def validate_report_items_against_candidates(items: list[ReportItem], candidates: list[NewsItem], field_name: str) -> None:
+    candidate_pairs = {(item.title, item.url) for item in candidates}
+    candidate_titles = {item.title for item in candidates}
+    candidate_urls = {item.url for item in candidates}
+    for item in items:
+        if (item.title, item.url) not in candidate_pairs:
+            if item.title not in candidate_titles:
+                raise ValueError(f"{field_name} contains title outside candidates: {item.title}")
+            if item.url not in candidate_urls:
+                raise ValueError(f"{field_name} contains URL outside candidates: {item.url}")
+            raise ValueError(f"{field_name} contains mismatched candidate title and URL: {item.title}")
+
+
+def validate_run_report(data: dict[str, Any], candidates: list[NewsItem]) -> RunReport:
+    if not isinstance(data, dict):
+        raise ValueError("Run report must be an object.")
+    schema_version = require_field(data, "schema_version")
+    if schema_version != SCHEMA_VERSION:
+        raise ValueError(f"Unsupported schema_version: {schema_version}")
+    report_type = require_string(data, "report_type")
+    if report_type != "run":
+        raise ValueError(f"Run report_type must be 'run', got {report_type!r}.")
+    status = require_string(data, "status")
+    if status not in RUN_STATUSES:
+        raise ValueError(f"Invalid run status: {status}")
+    report_date = require_string(data, "report_date")
+    generated_at = require_string(data, "generated_at")
+    candidate_count = require_field(data, "candidate_count")
+    if not isinstance(candidate_count, int) or isinstance(candidate_count, bool) or candidate_count < 0:
+        raise ValueError("Field candidate_count must be a non-negative integer.")
+
+    items = [report_item_from_dict(item) for item in require_item_list(data, "items")]
+    optional_references = [
+        report_item_from_dict(item) for item in require_item_list(data, "optional_references")
+    ]
+    low_value_reason = str(data.get("low_value_reason", "") or "").strip()
+    error_stage = str(data.get("error_stage", "") or "").strip()
+    error_message = str(data.get("error_message", "") or "").strip()
+
+    if status == "formal" and not items:
+        raise ValueError("Formal report must contain at least one item.")
+    if status == "low_value":
+        if items:
+            raise ValueError("Low-value report must not contain formal items.")
+        if not low_value_reason:
+            raise ValueError("Low-value report must include low_value_reason.")
+    if status == "failed" and (items or optional_references):
+        raise ValueError("Failed report must not contain items or optional references.")
+
+    validate_report_items_against_candidates(items, candidates, "items")
+    validate_report_items_against_candidates(optional_references, candidates, "optional_references")
+
+    return RunReport(
+        schema_version=schema_version,
+        report_type=report_type,
+        report_date=report_date,
+        generated_at=generated_at,
+        status=status,
+        candidate_count=candidate_count,
+        items=items,
+        optional_references=optional_references,
+        low_value_reason=low_value_reason,
+        error_stage=error_stage,
+        error_message=error_message,
+    )
+
+
+def report_item_to_dict(item: ReportItem) -> dict[str, Any]:
+    return {
+        "title": item.title,
+        "source": item.source,
+        "url": item.url,
+        "published": item.published,
+        "relevance_score": item.relevance_score,
+        "link_status": item.link_status,
+        "content_status": item.content_status,
+        "front_context": item.front_context,
+        "why_recommend": item.why_recommend,
+        "why_not_recommend": item.why_not_recommend,
+        "one_sentence": item.one_sentence,
+        "original_facts": list(item.original_facts),
+        "model_summary": list(item.model_summary),
+        "related_thoughts": list(item.related_thoughts),
+        "action": item.action,
+        "matched_keywords": list(item.matched_keywords),
+    }
+
+
+def run_report_to_dict(report: RunReport) -> dict[str, Any]:
+    return {
+        "schema_version": report.schema_version,
+        "report_type": report.report_type,
+        "report_date": report.report_date,
+        "generated_at": report.generated_at,
+        "status": report.status,
+        "candidate_count": report.candidate_count,
+        "items": [report_item_to_dict(item) for item in report.items],
+        "optional_references": [report_item_to_dict(item) for item in report.optional_references],
+        "low_value_reason": report.low_value_reason,
+        "error_stage": report.error_stage,
+        "error_message": report.error_message,
+    }
+
+
+def daily_report_to_dict(report: DailyReport) -> dict[str, Any]:
+    return {
+        "schema_version": report.schema_version,
+        "report_type": report.report_type,
+        "report_date": report.report_date,
+        "updated_at": report.updated_at,
+        "items": [report_item_to_dict(item) for item in report.items],
+    }
+
+
+def normalize_url_for_dedupe(url: str) -> str:
+    parsed = urlparse(url.strip())
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower().removeprefix("www.")
+    path = parsed.path.rstrip("/")
+    query_pairs = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        key_lower = key.lower()
+        if key_lower.startswith("utm_") or key_lower in TRACKING_QUERY_KEYS:
+            continue
+        query_pairs.append((key, value))
+    query = urlencode(sorted(query_pairs), doseq=True)
+    return urlunparse((scheme, netloc, path, "", query, ""))
+
+
+def load_daily_report(path: Path) -> DailyReport | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Daily JSON is malformed: {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Daily JSON must be an object: {path}")
+    schema_version = require_field(data, "schema_version")
+    if schema_version != SCHEMA_VERSION:
+        raise ValueError(f"Unsupported daily schema_version: {schema_version}")
+    report_type = require_string(data, "report_type")
+    if report_type != "daily":
+        raise ValueError(f"Daily report_type must be 'daily', got {report_type!r}.")
+    return DailyReport(
+        schema_version=schema_version,
+        report_type=report_type,
+        report_date=require_string(data, "report_date"),
+        updated_at=require_string(data, "updated_at"),
+        items=[report_item_from_dict(item) for item in require_item_list(data, "items")],
+    )
+
+
+def merge_daily_items(old_items: list[ReportItem], new_items: list[ReportItem]) -> list[ReportItem]:
+    merged = list(old_items)
+    seen = {normalize_url_for_dedupe(item.url) for item in old_items}
+    for item in new_items:
+        normalized_url = normalize_url_for_dedupe(item.url)
+        if normalized_url in seen:
+            continue
+        merged.append(item)
+        seen.add(normalized_url)
+    return merged
+
+
+def markdown_list(values: list[str]) -> list[str]:
+    return [f"  - {value}" for value in values] if values else ["  - 无"]
+
+
+def render_report_item_markdown(item: ReportItem, index: int) -> list[str]:
+    lines = [
+        f"## {index}. {item.title}",
+        "",
+        f"- 来源：{item.source}",
+        f"- 原文链接：[{item.url}]({item.url})",
+        f"- 发布时间：{item.published or '未知'}",
+        f"- 链接状态：{item.link_status}",
+        f"- 正文状态：{item.content_status}",
+        f"- 相关性评分：{item.relevance_score:g} / 10",
+        f"- 前置背景：{item.front_context}",
+        f"- 为什么推荐：{item.why_recommend}",
+        f"- 为什么可能不推荐：{item.why_not_recommend}",
+        f"- 一句话结论：{item.one_sentence}",
+        "",
+        "### 原文事实",
+        *markdown_list(item.original_facts),
+        "",
+        "### 模型总结",
+        *markdown_list(item.model_summary),
+        "",
+        "### 与用户的关联思考",
+        *markdown_list(item.related_thoughts),
+        "",
+        f"- 建议行动：{item.action}",
+        f"- 命中关键词：{', '.join(item.matched_keywords) if item.matched_keywords else '无'}",
+        "",
+    ]
+    return lines
+
+
+def render_run_markdown(report: RunReport) -> str:
+    lines = [
+        f"# 每日 News 助手 - 本次运行 - {report.report_date}",
+        "",
+        f"- 生成时间：{report.generated_at}",
+        f"- 运行状态：{report.status}",
+        f"- 候选新闻数：{report.candidate_count}",
+        f"- 正式新闻数：{len(report.items)}",
+        "",
+    ]
+    if report.status == "failed":
+        lines.extend(
+            [
+                "## 本次运行失败",
+                "",
+                f"- 失败阶段：{report.error_stage or 'unknown'}",
+                f"- 错误信息：{report.error_message or 'unknown'}",
+            ]
+        )
+        return "\n".join(lines).rstrip() + "\n"
+    if report.status == "low_value":
+        lines.extend(
+            [
+                "## 今日无高价值新闻",
+                "",
+                report.low_value_reason or "本次运行没有达到正式日报门槛的新闻。",
+                "",
+            ]
+        )
+        if report.optional_references:
+            lines.extend(["## 可选参考", ""])
+            for index, item in enumerate(report.optional_references, start=1):
+                lines.extend(render_report_item_markdown(item, index))
+        return "\n".join(lines).rstrip() + "\n"
+
+    for index, item in enumerate(report.items, start=1):
+        lines.extend(render_report_item_markdown(item, index))
+    if report.optional_references:
+        lines.extend(["# 可选参考", ""])
+        for index, item in enumerate(report.optional_references, start=1):
+            lines.extend(render_report_item_markdown(item, index))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_daily_markdown(report: DailyReport) -> str:
+    lines = [
+        f"# 每日 News 助手 - 当天累计日报 - {report.report_date}",
+        "",
+        f"- 更新时间：{report.updated_at}",
+        f"- 累计正式新闻数：{len(report.items)}",
+        "",
+    ]
+    if not report.items:
+        lines.append("今日暂无累计正式新闻。")
+        return "\n".join(lines).rstrip() + "\n"
+    for index, item in enumerate(report.items, start=1):
+        lines.extend(render_report_item_markdown(item, index))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(text, encoding="utf-8")
+        temp_path.replace(path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temp_path.replace(path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def build_failed_report(
+    error_stage: str,
+    error_message: str,
+    report_date: str,
+    generated_at: str,
+    candidate_count: int,
+) -> RunReport:
+    return RunReport(
+        schema_version=SCHEMA_VERSION,
+        report_type="run",
+        report_date=report_date,
+        generated_at=generated_at,
+        status="failed",
+        candidate_count=candidate_count,
+        items=[],
+        optional_references=[],
+        error_stage=error_stage,
+        error_message=error_message,
+    )
+
+
+def build_low_value_report(
+    report_date: str,
+    generated_at: str,
+    candidate_count: int,
+    reason: str,
+) -> RunReport:
+    return RunReport(
+        schema_version=SCHEMA_VERSION,
+        report_type="run",
+        report_date=report_date,
+        generated_at=generated_at,
+        status="low_value",
+        candidate_count=candidate_count,
+        items=[],
+        optional_references=[],
+        low_value_reason=reason,
+    )
+
+
+def build_archive_paths(output_dir: Path, now: datetime) -> tuple[Path, Path]:
+    archive_dir = output_dir / "archive"
+    archive_time = now
+    while True:
+        stem = f"daily_news_{archive_time.strftime('%Y-%m-%d_%H%M%S')}"
+        json_path = archive_dir / f"{stem}.json"
+        md_path = archive_dir / f"{stem}.md"
+        if not json_path.exists() and not md_path.exists():
+            return json_path, md_path
+        archive_time += timedelta(seconds=1)
+
+
+def write_run_outputs(output_dir: Path, report: RunReport, now: datetime | None = None) -> dict[str, Path]:
+    now = now or datetime.now()
+    latest_json_path = output_dir / "latest_daily_news.json"
+    latest_md_path = output_dir / "latest_daily_news.md"
+    archive_json_path, archive_md_path = build_archive_paths(output_dir, now)
+    report_data = run_report_to_dict(report)
+    markdown = render_run_markdown(report)
+
+    write_json_atomic(latest_json_path, report_data)
+    write_text_atomic(latest_md_path, markdown)
+    write_json_atomic(archive_json_path, report_data)
+    write_text_atomic(archive_md_path, markdown)
+
+    return {
+        "latest_json": latest_json_path,
+        "latest_md": latest_md_path,
+        "archive_json": archive_json_path,
+        "archive_md": archive_md_path,
+    }
+
+
+def write_daily_outputs(output_dir: Path, report: RunReport, now: datetime | None = None) -> dict[str, Path]:
+    if report.status != "formal":
+        return {}
+    now = now or datetime.now()
+    daily_json_path = output_dir / f"daily_news_{report.report_date}.json"
+    daily_md_path = output_dir / f"daily_news_{report.report_date}.md"
+    existing = load_daily_report(daily_json_path)
+    if existing is not None and existing.report_date != report.report_date:
+        raise ValueError(
+            f"Existing daily report date {existing.report_date} does not match run date {report.report_date}."
+        )
+    merged_items = merge_daily_items(existing.items if existing else [], report.items)
+    daily_report = DailyReport(
+        schema_version=SCHEMA_VERSION,
+        report_type="daily",
+        report_date=report.report_date,
+        updated_at=now.isoformat(timespec="seconds"),
+        items=merged_items,
+    )
+    write_json_atomic(daily_json_path, daily_report_to_dict(daily_report))
+    write_text_atomic(daily_md_path, render_daily_markdown(daily_report))
+    return {"daily_json": daily_json_path, "daily_md": daily_md_path}
+
+
+def select_processed_candidates(report: RunReport, candidates: list[NewsItem]) -> list[NewsItem]:
+    if report.status != "formal":
+        return []
+    candidate_by_url = {normalize_url_for_dedupe(item.url): item for item in candidates}
+    selected: list[NewsItem] = []
+    seen: set[str] = set()
+    for item in report.items:
+        normalized_url = normalize_url_for_dedupe(item.url)
+        candidate = candidate_by_url.get(normalized_url)
+        if candidate and normalized_url not in seen:
+            selected.append(candidate)
+            seen.add(normalized_url)
+    return selected
+
+
 def truncate(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
@@ -492,15 +1022,24 @@ def format_recent_feedback(feedback: dict[str, Any], limit: int = 7) -> list[str
     return lines
 
 
-def build_llm_prompt(config: dict[str, Any], feedback: dict[str, Any], candidates: list[NewsItem]) -> str:
+def build_llm_prompt(
+    config: dict[str, Any],
+    feedback: dict[str, Any],
+    candidates: list[NewsItem],
+    report_date: str | None = None,
+    generated_at: str | None = None,
+) -> str:
     final_top_n = int(config.get("final_top_n", 8))
     user_profile = config.get("user_profile", "")
     learning_style = config.get("learning_style", "")
     learning_preferences = feedback.get("learning_preferences", []) or []
     recent_feedback_lines = format_recent_feedback(feedback)
+    report_date = report_date or datetime.now().strftime("%Y-%m-%d")
+    generated_at = generated_at or local_timestamp()
 
     lines = [
-        "请从下面候选新闻中选择最值得我今天阅读的新闻，并生成中文 Markdown 日报。",
+        "请从下面候选新闻中选择最值得我今天阅读的新闻，并只返回一个 JSON object。",
+        "不要输出 Markdown，不要使用代码围栏，不要在 JSON 前后添加解释文字。",
         "",
         f"候选新闻总数是 {len(candidates)} 条。最多选择 {min(final_top_n, len(candidates))} 条。",
         "只能输出下面候选列表中明确出现的新闻标题，不得新增候选外新闻，不得把背景材料改写成额外新闻条目。",
@@ -511,10 +1050,35 @@ def build_llm_prompt(config: dict[str, Any], feedback: dict[str, Any], candidate
         "如果 url_status 不是 2xx，不得推荐为“值得深入阅读”。",
         "如果只有标题和 RSS 摘要，只能说“信息不足，需人工确认”。",
         "候选新闻里的 keyword_score 是内部关键词排序分数，只能作为参考，不要直接展示为最终相关性评分。",
-        "最终 Markdown 中的“相关性评分”必须由你根据用户背景和新闻价值重新判断，输出 1-10 的整数或一位小数。",
+        "relevance_score 必须由你根据用户背景和新闻价值重新判断，输出 1-10 的数字，不得直接使用 keyword_score。",
         "如果某条新闻涉及用户可能不熟悉的概念、机构、技术路线或论文方法，请先用 3-5 句话解释前置背景，再进入结论和行动建议。",
         "不要把“勉强相关”的新闻硬说成强相关。如果只是弱相关，必须明确写“弱相关，可跳过”。",
-        "如果候选整体相关性较低，生成“今日无高价值新闻”，不要硬凑日报。",
+        "如果候选整体相关性较低，返回 status=low_value，不要硬凑日报。",
+        "status 只能是 formal 或 low_value。failed 是程序诊断状态，禁止你返回 failed。",
+        "",
+        "JSON 顶层字段必须完整包含：",
+        "{",
+        f'  "schema_version": {SCHEMA_VERSION},',
+        '  "report_type": "run",',
+        f'  "report_date": "{report_date}",',
+        f'  "generated_at": "{generated_at}",',
+        '  "status": "formal 或 low_value",',
+        '  "candidate_count": 数字,',
+        '  "items": [],',
+        '  "optional_references": [],',
+        '  "low_value_reason": "",',
+        '  "error_stage": "",',
+        '  "error_message": ""',
+        "}",
+        "",
+        "formal 规则：items 至少 1 条；optional_references 可以为空。",
+        "low_value 规则：items 必须为空；必须填写 low_value_reason；optional_references 可以放低优先级或需人工确认的候选。",
+        "",
+        "items 和 optional_references 中每个对象必须完整包含：",
+        "title, source, url, published, relevance_score, link_status, content_status, front_context,",
+        "why_recommend, why_not_recommend, one_sentence, original_facts, model_summary, related_thoughts, action, matched_keywords。",
+        "original_facts 只能写原文明确事实；model_summary 写提炼总结；related_thoughts 写和用户背景/项目的关联思考。",
+        "original_facts、model_summary、related_thoughts、matched_keywords 必须是字符串数组。",
         "",
         "我的背景：",
         str(user_profile),
@@ -527,21 +1091,6 @@ def build_llm_prompt(config: dict[str, Any], feedback: dict[str, Any], candidate
         "",
         "最近 7 条 daily_feedback：",
         *(recent_feedback_lines or ["- 无"]),
-        "",
-        "每条摘要必须使用以下结构：",
-        "## 标题",
-        "- 来源：",
-        "- 原文链接：",
-        "- 链接状态：",
-        "- 正文抓取状态：",
-        "- 相关性评分：1-10 分，不要使用 keyword_score 原值",
-        "- 前置背景：如果涉及陌生概念，用 3-5 句话解释；如果不需要，写“无需额外前置背景”",
-        "- 为什么推荐：",
-        "- 为什么可能不推荐：",
-        "- 一句话结论：",
-        "- 你需要知道：",
-        "- 和我有什么关系：",
-        "- 建议行动：",
         "",
         "候选新闻：",
     ]
@@ -577,11 +1126,17 @@ def build_llm_prompt(config: dict[str, Any], feedback: dict[str, Any], candidate
     return "\n".join(lines)
 
 
-def generate_markdown(config: dict[str, Any], feedback: dict[str, Any], candidates: list[NewsItem]) -> str:
+def generate_run_report(
+    config: dict[str, Any],
+    feedback: dict[str, Any],
+    candidates: list[NewsItem],
+    report_date: str,
+    generated_at: str,
+) -> RunReport:
     api_key, base_url, model = load_llm_settings()
     client = OpenAI(api_key=api_key, base_url=base_url)
 
-    prompt = build_llm_prompt(config, feedback, candidates)
+    prompt = build_llm_prompt(config, feedback, candidates, report_date, generated_at)
     logging.info("Sending %s candidates to LLM. Prompt length: %s chars.", len(candidates), len(prompt))
     response = client.chat.completions.create(
         model=model,
@@ -589,8 +1144,8 @@ def generate_markdown(config: dict[str, Any], feedback: dict[str, Any], candidat
             {
                 "role": "system",
                 "content": (
-                    "你是一个谨慎的中文新闻摘要助手。你重视事实边界、原文链接、"
-                    "学习价值和对用户当前项目的相关性。"
+                    "你是一个谨慎的中文新闻摘要助手。你只输出严格 JSON，重视事实边界、"
+                    "原文链接、学习价值和对用户当前项目的相关性。"
                 ),
             },
             {"role": "user", "content": prompt},
@@ -600,101 +1155,10 @@ def generate_markdown(config: dict[str, Any], feedback: dict[str, Any], candidat
     content = response.choices[0].message.content
     if not content:
         raise RuntimeError("LLM returned an empty response.")
-    return content.strip()
-
-
-def build_archive_path(archive_dir: Path, now: datetime) -> Path:
-    archive_time = now
-    while True:
-        archive_path = archive_dir / f"daily_news_{archive_time.strftime('%Y-%m-%d_%H%M%S')}.md"
-        if not archive_path.exists():
-            return archive_path
-        archive_time += timedelta(seconds=1)
-
-
-def write_output(
-    config: dict[str, Any],
-    markdown_body: str,
-    candidates_count: int,
-    update_daily: bool = True,
-) -> dict[str, Path]:
-    output_dir = ROOT_DIR / str(config.get("output_dir", "outputs"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    archive_dir = output_dir / "archive"
-    archive_dir.mkdir(parents=True, exist_ok=True)
-
-    now = datetime.now()
-    today = now.strftime("%Y-%m-%d")
-    latest_path = output_dir / "latest_daily_news.md"
-    daily_path = output_dir / f"daily_news_{today}.md"
-    archive_path = build_archive_path(archive_dir, now)
-
-    header = "\n".join(
-        [
-            f"# 每日 News 助手 - {today}",
-            "",
-            f"- 生成时间：{now.strftime('%Y-%m-%d %H:%M:%S')}",
-            f"- 候选新闻数：{candidates_count}",
-            "",
-        ]
-    )
-    content = header + markdown_body + "\n"
-    latest_path.write_text(content, encoding="utf-8")
-    if update_daily:
-        daily_path.write_text(content, encoding="utf-8")
-    else:
-        logging.info("Skipped daily output overwrite for low-value report: %s", daily_path)
-    archive_path.write_text(content, encoding="utf-8")
-
-    output_paths = {
-        "latest": latest_path,
-        "daily": daily_path,
-        "archive": archive_path,
-    }
-    for label, path in output_paths.items():
-        if label == "daily" and not update_daily:
-            continue
-        logging.info("Saved %s output: %s", label, path)
-    return output_paths
-
-
-def describe_content_status(item: NewsItem) -> str:
-    if item.invalid_link:
-        return "链接不可用，需人工确认"
-    if item.weak_content:
-        return "正文抓取不足，需人工打开确认"
-    if item.content_available:
-        return f"正文可读，长度 {item.content_length} 字符"
-    return "正文不可读，需人工确认"
-
-
-def build_empty_report(config: dict[str, Any], rejected_candidates: list[NewsItem] | None = None) -> dict[str, Path]:
-    lines = [
-        "今日无高价值新闻。",
-        "",
-        "原因可能是候选新闻链接不可用、正文抓取不足，或今天没有命中兴趣关键词且未处理过的新闻。",
-        "请查看 logs/run.log 中的 url_status、content_length、invalid_link 和 weak_content 记录。",
-    ]
-
-    if rejected_candidates:
-        lines.extend(["", "## 需人工确认的候选", ""])
-        for item in rejected_candidates[:10]:
-            lines.extend(
-                [
-                    f"### {item.title}",
-                    f"- 来源：{item.source}",
-                    f"- 原文链接：{item.url}",
-                    f"- 链接状态：{item.url_status}",
-                    f"- 正文抓取状态：{describe_content_status(item)}",
-                    f"- 建议搜索：{item.suggested_search_query}",
-                ]
-            )
-            if item.fallback_url:
-                lines.append(f"- Hacker News fallback：{item.fallback_url}")
-            lines.append("")
-
-    markdown = "\n".join(lines)
-    return write_output(config, markdown, candidates_count=0, update_daily=False)
+    data = parse_llm_json(content)
+    if data.get("status") == "failed":
+        raise ValueError("LLM must not return failed status.")
+    return validate_run_report(data, candidates)
 
 
 def main() -> None:
@@ -705,21 +1169,70 @@ def main() -> None:
     feedback = load_feedback()
     conn = init_db(str(config.get("db_path", "news.db")))
     try:
+        now = datetime.now()
+        report_date = now.strftime("%Y-%m-%d")
+        generated_at = now.isoformat(timespec="seconds")
+        output_dir = ROOT_DIR / str(config.get("output_dir", "outputs"))
         candidates = build_candidates(config, feedback, conn)
         logging.info("Built %s candidates.", len(candidates))
         llm_candidates = filter_llm_candidates(candidates)
 
         if not llm_candidates:
-            output_paths = build_empty_report(config, candidates)
+            report = build_low_value_report(
+                report_date=report_date,
+                generated_at=generated_at,
+                candidate_count=len(candidates),
+                reason=(
+                    "本次运行没有可进入正式日报的新闻。原因可能是候选新闻链接不可用、"
+                    "正文抓取不足、相关性分数过低，或今天没有命中兴趣关键词且未处理过的新闻。"
+                ),
+            )
         else:
-            markdown = generate_markdown(config, feedback, llm_candidates)
-            output_paths = write_output(config, markdown, candidates_count=len(llm_candidates))
-            mark_processed(conn, llm_candidates)
+            try:
+                report = generate_run_report(config, feedback, llm_candidates, report_date, generated_at)
+            except Exception as exc:
+                logging.exception("Failed to generate or validate LLM JSON: %s", exc)
+                report = build_failed_report(
+                    error_stage="llm_json",
+                    error_message=str(exc),
+                    report_date=report_date,
+                    generated_at=generated_at,
+                    candidate_count=len(llm_candidates),
+                )
+
+        try:
+            output_paths = write_run_outputs(output_dir, report, now)
+        except Exception as exc:
+            logging.exception("Failed to write latest/archive outputs: %s", exc)
+            raise
+
+        if report.status == "formal":
+            try:
+                output_paths.update(write_daily_outputs(output_dir, report, now))
+            except Exception as exc:
+                logging.exception("Failed to merge or write daily cumulative report: %s", exc)
+                failed_report = build_failed_report(
+                    error_stage="daily_write",
+                    error_message=str(exc),
+                    report_date=report_date,
+                    generated_at=local_timestamp(),
+                    candidate_count=len(llm_candidates),
+                )
+                output_paths.update(write_run_outputs(output_dir, failed_report))
+                report = failed_report
+            else:
+                processed_items = select_processed_candidates(report, llm_candidates)
+                mark_processed(conn, processed_items)
 
         logging.info("Daily news assistant finished. Outputs: %s", output_paths)
-        print(f"Latest output written to: {output_paths['latest'].resolve()}")
-        print(f"Daily output path: {output_paths['daily'].resolve()}")
-        print(f"Archive output written to: {output_paths['archive'].resolve()}")
+        print(f"Run status: {report.status}")
+        print(f"Latest JSON written to: {output_paths['latest_json'].resolve()}")
+        print(f"Latest Markdown written to: {output_paths['latest_md'].resolve()}")
+        if "daily_json" in output_paths:
+            print(f"Daily JSON written to: {output_paths['daily_json'].resolve()}")
+            print(f"Daily Markdown written to: {output_paths['daily_md'].resolve()}")
+        print(f"Archive JSON written to: {output_paths['archive_json'].resolve()}")
+        print(f"Archive Markdown written to: {output_paths['archive_md'].resolve()}")
     finally:
         conn.close()
 

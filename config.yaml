@@ -1,0 +1,61 @@
+user_profile: >
+  我是 GIS 专业本科生，关注 AI Agent、RAG、GIS、遥感、AgriAI、轻量部署、Python 工程和学习效率。
+
+learning_style: >
+  先讲直觉，再讲结构；不要只堆术语；需要指出和我当前项目/学习的关系；要给出是否值得深入的判断。
+
+rss_sources:
+  - name: OpenAI Blog
+    url: https://openai.com/blog/rss.xml
+  - name: Anthropic News
+    url: https://www.anthropic.com/news/rss.xml
+  - name: Hugging Face Blog
+    url: https://huggingface.co/blog/feed.xml
+  - name: Google DeepMind Blog
+    url: https://deepmind.google/blog/rss.xml
+  - name: Papers with Code
+    url: https://paperswithcode.com/rss
+  - name: Hacker News
+    url: https://news.ycombinator.com/rss
+  - name: NASA Earthdata
+    url: https://www.earthdata.nasa.gov/news/rss.xml
+
+keywords:
+  high_priority:
+    - RAG
+    - retrieval
+    - agent
+    - AI agent
+    - LLM
+    - MCP
+    - Claude
+    - Codex
+    - OpenAI
+    - Anthropic
+    - Hugging Face
+    - GIS
+    - remote sensing
+    - Earth Engine
+    - YOLO
+    - computer vision
+    - agriculture
+    - vector database
+  medium_priority:
+    - Python
+    - workflow
+    - developer tools
+    - automation
+    - research
+    - paper
+  low_priority:
+    - funding
+    - marketing
+    - crypto
+    - celebrity
+
+max_items_per_source: 8
+max_candidates: 30
+final_top_n: 8
+fetch_full_text: true
+output_dir: outputs
+db_path: news.db

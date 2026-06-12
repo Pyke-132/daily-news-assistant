@@ -78,6 +78,7 @@ class RunReport:
     report_date: str
     generated_at: str
     status: str
+    overview: str
     candidate_count: int
     items: list[ReportItem]
     optional_references: list[ReportItem]
@@ -97,6 +98,15 @@ class DailyReport:
 
 SCHEMA_VERSION = 1
 RUN_STATUSES = {"formal", "low_value", "failed"}
+STATUS_LABELS = {
+    "formal": "正式日报",
+    "low_value": "今日无高价值新闻",
+    "failed": "运行失败",
+}
+CONTENT_STATUS_LABELS = {
+    "available": "正文可读",
+    "content_available": "正文可读",
+}
 TRACKING_QUERY_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
 INVALID_STATUS_CODES = {404, 410, 500, 502, 503, 504}
 MIN_CONTENT_LENGTH = 500
@@ -570,6 +580,11 @@ def require_item_list(data: dict[str, Any], field_name: str) -> list[dict[str, A
     return value
 
 
+def sentence_count(text: str) -> int:
+    parts = [part.strip() for part in re.split(r"[。！？!?]+", text) if part.strip()]
+    return len(parts)
+
+
 def looks_like_http_url(url: str) -> bool:
     parsed = urlparse(url)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
@@ -636,6 +651,7 @@ def validate_run_report(data: dict[str, Any], candidates: list[NewsItem]) -> Run
         raise ValueError(f"Invalid run status: {status}")
     report_date = require_string(data, "report_date")
     generated_at = require_string(data, "generated_at")
+    overview = str(data.get("overview", "") or "").strip()
     candidate_count = require_field(data, "candidate_count")
     if not isinstance(candidate_count, int) or isinstance(candidate_count, bool) or candidate_count < 0:
         raise ValueError("Field candidate_count must be a non-negative integer.")
@@ -650,6 +666,10 @@ def validate_run_report(data: dict[str, Any], candidates: list[NewsItem]) -> Run
 
     if status == "formal" and not items:
         raise ValueError("Formal report must contain at least one item.")
+    if status == "formal":
+        overview_sentences = sentence_count(overview)
+        if not overview or not 2 <= overview_sentences <= 4:
+            raise ValueError("Formal report overview must contain 2 to 4 sentences.")
     if status == "low_value":
         if items:
             raise ValueError("Low-value report must not contain formal items.")
@@ -667,6 +687,7 @@ def validate_run_report(data: dict[str, Any], candidates: list[NewsItem]) -> Run
         report_date=report_date,
         generated_at=generated_at,
         status=status,
+        overview=overview,
         candidate_count=candidate_count,
         items=items,
         optional_references=optional_references,
@@ -704,6 +725,7 @@ def run_report_to_dict(report: RunReport) -> dict[str, Any]:
         "report_date": report.report_date,
         "generated_at": report.generated_at,
         "status": report.status,
+        "overview": report.overview,
         "candidate_count": report.candidate_count,
         "items": [report_item_to_dict(item) for item in report.items],
         "optional_references": [report_item_to_dict(item) for item in report.optional_references],
@@ -778,6 +800,14 @@ def markdown_list(values: list[str]) -> list[str]:
     return [f"  - {value}" for value in values] if values else ["  - 无"]
 
 
+def display_status(status: str) -> str:
+    return STATUS_LABELS.get(status, status)
+
+
+def display_content_status(status: str) -> str:
+    return CONTENT_STATUS_LABELS.get(status, status)
+
+
 def render_report_item_markdown(item: ReportItem, index: int) -> list[str]:
     lines = [
         f"## {index}. {item.title}",
@@ -786,7 +816,7 @@ def render_report_item_markdown(item: ReportItem, index: int) -> list[str]:
         f"- 原文链接：[{item.url}]({item.url})",
         f"- 发布时间：{item.published or '未知'}",
         f"- 链接状态：{item.link_status}",
-        f"- 正文状态：{item.content_status}",
+        f"- 正文状态：{display_content_status(item.content_status)}",
         f"- 相关性评分：{item.relevance_score:g} / 10",
         f"- 前置背景：{item.front_context}",
         f"- 为什么推荐：{item.why_recommend}",
@@ -814,7 +844,7 @@ def render_run_markdown(report: RunReport) -> str:
         f"# 每日 News 助手 - 本次运行 - {report.report_date}",
         "",
         f"- 生成时间：{report.generated_at}",
-        f"- 运行状态：{report.status}",
+        f"- 运行状态：{display_status(report.status)}",
         f"- 候选新闻数：{report.candidate_count}",
         f"- 正式新闻数：{len(report.items)}",
         "",
@@ -844,6 +874,7 @@ def render_run_markdown(report: RunReport) -> str:
                 lines.extend(render_report_item_markdown(item, index))
         return "\n".join(lines).rstrip() + "\n"
 
+    lines.extend(["## 本次概述", "", report.overview, ""])
     for index, item in enumerate(report.items, start=1):
         lines.extend(render_report_item_markdown(item, index))
     if report.optional_references:
@@ -860,10 +891,17 @@ def render_daily_markdown(report: DailyReport) -> str:
         f"- 更新时间：{report.updated_at}",
         f"- 累计正式新闻数：{len(report.items)}",
         "",
+        "## 今日概览",
+        "",
+        f"累计正式新闻数：{len(report.items)}",
+        "",
     ]
     if not report.items:
         lines.append("今日暂无累计正式新闻。")
         return "\n".join(lines).rstrip() + "\n"
+    for item in report.items:
+        lines.append(f"- {item.title}：{item.one_sentence}")
+    lines.append("")
     for index, item in enumerate(report.items, start=1):
         lines.extend(render_report_item_markdown(item, index))
     return "\n".join(lines).rstrip() + "\n"
@@ -904,6 +942,7 @@ def build_failed_report(
         report_date=report_date,
         generated_at=generated_at,
         status="failed",
+        overview="",
         candidate_count=candidate_count,
         items=[],
         optional_references=[],
@@ -924,6 +963,7 @@ def build_low_value_report(
         report_date=report_date,
         generated_at=generated_at,
         status="low_value",
+        overview="",
         candidate_count=candidate_count,
         items=[],
         optional_references=[],
@@ -1072,6 +1112,7 @@ def build_llm_prompt(
         f'  "report_date": "{report_date}",',
         f'  "generated_at": "{generated_at}",',
         '  "status": "formal 或 low_value",',
+        '  "overview": "formal 时 2 到 4 句中文概述；low_value 时可为空",',
         '  "candidate_count": 数字,',
         '  "items": [],',
         '  "optional_references": [],',
@@ -1080,8 +1121,9 @@ def build_llm_prompt(
         '  "error_message": ""',
         "}",
         "",
-        "formal 规则：items 至少 1 条；optional_references 可以为空。",
-        "low_value 规则：items 必须为空；必须填写 low_value_reason；optional_references 可以放低优先级或需人工确认的候选。",
+        "formal 规则：items 至少 1 条；overview 必须是 2 到 4 句中文，概括本次最值得关注的主题，点出不同新闻之间的共同趋势或差异；optional_references 可以为空。",
+        "overview 不得新增原文和正式 items 之外的事实，不得逐条机械复述标题。",
+        "low_value 规则：items 必须为空；overview 可以为空；必须填写 low_value_reason；optional_references 可以放低优先级或需人工确认的候选。",
         "",
         "items 和 optional_references 中每个对象必须完整包含：",
         "title, source, url, published, relevance_score, link_status, content_status, front_context,",

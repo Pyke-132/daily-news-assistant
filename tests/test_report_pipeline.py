@@ -57,6 +57,7 @@ def formal_report_dict(items=None):
         "report_date": "2026-06-12",
         "generated_at": "2026-06-12T12:00:00",
         "status": "formal",
+        "overview": "本次最值得关注的是开发者模型和 Agent 风险。两者都指向轻量工具越来越强，但安全边界仍需要认真处理。",
         "candidate_count": 1,
         "items": items if items is not None else [item_dict()],
         "optional_references": [],
@@ -83,8 +84,16 @@ class ReportPipelineTests(unittest.TestCase):
         report = main.validate_run_report(formal_report_dict(), [candidate()])
 
         self.assertEqual(report.status, "formal")
+        self.assertIn("开发者模型", report.overview)
         self.assertEqual(len(report.items), 1)
         self.assertEqual(report.items[0].relevance_score, 8.5)
+
+    def test_validate_formal_report_requires_overview(self):
+        data = formal_report_dict()
+        data["overview"] = ""
+
+        with self.assertRaises(ValueError):
+            main.validate_run_report(data, [candidate()])
 
     def test_validate_low_value_report_requires_empty_items(self):
         data = formal_report_dict(items=[])
@@ -182,17 +191,29 @@ class ReportPipelineTests(unittest.TestCase):
         low = main.validate_run_report(low_data, [candidate()])
         failed = main.build_failed_report("json_parse", "bad json", "2026-06-12", "2026-06-12T12:00:00", 1)
 
-        self.assertIn("## 1. Item One", main.render_run_markdown(formal))
-        self.assertIn("今日无高价值新闻", main.render_run_markdown(low))
-        self.assertIn("本次运行失败", main.render_run_markdown(failed))
+        formal_markdown = main.render_run_markdown(formal)
+        low_markdown = main.render_run_markdown(low)
+        failed_markdown = main.render_run_markdown(failed)
+
+        self.assertIn("运行状态：正式日报", formal_markdown)
+        self.assertIn("## 本次概述", formal_markdown)
+        self.assertIn(formal.overview, formal_markdown)
+        self.assertIn("正文状态：正文可读", formal_markdown)
+        self.assertIn("## 1. Item One", formal_markdown)
+        self.assertIn("运行状态：今日无高价值新闻", low_markdown)
+        self.assertIn("今日无高价值新闻", low_markdown)
+        self.assertIn("运行状态：运行失败", failed_markdown)
+        self.assertIn("本次运行失败", failed_markdown)
 
     def test_write_run_outputs_creates_matching_archive_stems_and_latest(self):
         report = main.validate_run_report(formal_report_dict(), [candidate()])
         with tempfile.TemporaryDirectory() as tmp:
             paths = main.write_run_outputs(Path(tmp), report)
+            latest_json = json.loads(paths["latest_json"].read_text(encoding="utf-8"))
 
             self.assertTrue(paths["latest_json"].exists())
             self.assertTrue(paths["latest_md"].exists())
+            self.assertEqual(latest_json["overview"], report.overview)
             self.assertEqual(paths["archive_json"].stem, paths["archive_md"].stem)
 
     def test_write_daily_outputs_only_for_formal_and_can_regenerate_markdown(self):
@@ -203,7 +224,11 @@ class ReportPipelineTests(unittest.TestCase):
 
             self.assertEqual(len(daily.items), 1)
             self.assertIn("Item One", paths["daily_md"].read_text(encoding="utf-8"))
-            self.assertIn("Item One", main.render_daily_markdown(daily))
+            daily_markdown = main.render_daily_markdown(daily)
+            self.assertIn("## 今日概览", daily_markdown)
+            self.assertIn("累计正式新闻数：1", daily_markdown)
+            self.assertIn("One sentence.", daily_markdown)
+            self.assertIn("Item One", daily_markdown)
 
     def test_write_daily_outputs_does_not_create_daily_for_low_value_or_failed(self):
         low_data = formal_report_dict(items=[])
@@ -307,6 +332,7 @@ class ReportPipelineTests(unittest.TestCase):
         second_data["candidate_count"] = 2
         third_data = formal_report_dict(items=[])
         third_data["status"] = "low_value"
+        third_data["overview"] = ""
         third_data["candidate_count"] = 1
         third_data["low_value_reason"] = "Only optional references were found."
         third_data["optional_references"] = [
@@ -361,7 +387,7 @@ class ReportPipelineTests(unittest.TestCase):
             for json_path, md_path in zip(archive_jsons, archive_mds):
                 archive_data = json.loads(json_path.read_text(encoding="utf-8"))
                 archive_md = md_path.read_text(encoding="utf-8")
-                self.assertIn(archive_data["status"], archive_md)
+                self.assertIn(main.display_status(archive_data["status"]), archive_md)
 
             self.assertEqual([item.title for item in daily.items], ["News A", "News B", "News C"])
             self.assertEqual(
@@ -373,8 +399,8 @@ class ReportPipelineTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(daily_md.count("## 1. News A"), 1)
-            self.assertEqual(daily_md.count("News B"), 1)
-            self.assertEqual(daily_md.count("News C"), 1)
+            self.assertEqual(daily_md.count("## 2. News B"), 1)
+            self.assertEqual(daily_md.count("## 3. News C"), 1)
             for item in daily.items:
                 self.assertIn(item.title, daily_md)
                 self.assertIn(item.url, daily_md)

@@ -964,13 +964,18 @@ def write_run_outputs(output_dir: Path, report: RunReport, now: datetime | None 
     }
 
 
-def write_daily_outputs(output_dir: Path, report: RunReport, now: datetime | None = None) -> dict[str, Path]:
+def write_daily_outputs(
+    output_dir: Path,
+    report: RunReport,
+    now: datetime | None = None,
+    existing_daily: DailyReport | None = None,
+) -> dict[str, Path]:
     if report.status != "formal":
         return {}
     now = now or datetime.now()
     daily_json_path = output_dir / f"daily_news_{report.report_date}.json"
     daily_md_path = output_dir / f"daily_news_{report.report_date}.md"
-    existing = load_daily_report(daily_json_path)
+    existing = existing_daily if existing_daily is not None else load_daily_report(daily_json_path)
     if existing is not None and existing.report_date != report.report_date:
         raise ValueError(
             f"Existing daily report date {existing.report_date} does not match run date {report.report_date}."
@@ -988,12 +993,16 @@ def write_daily_outputs(output_dir: Path, report: RunReport, now: datetime | Non
     return {"daily_json": daily_json_path, "daily_md": daily_md_path}
 
 
-def select_processed_candidates(report: RunReport, candidates: list[NewsItem]) -> list[NewsItem]:
+def select_processed_candidates(
+    report: RunReport,
+    candidates: list[NewsItem],
+    existing_daily_items: list[ReportItem] | None = None,
+) -> list[NewsItem]:
     if report.status != "formal":
         return []
     candidate_by_url = {normalize_url_for_dedupe(item.url): item for item in candidates}
     selected: list[NewsItem] = []
-    seen: set[str] = set()
+    seen: set[str] = {normalize_url_for_dedupe(item.url) for item in existing_daily_items or []}
     for item in report.items:
         normalized_url = normalize_url_for_dedupe(item.url)
         candidate = candidate_by_url.get(normalized_url)
@@ -1208,7 +1217,10 @@ def main() -> None:
 
         if report.status == "formal":
             try:
-                output_paths.update(write_daily_outputs(output_dir, report, now))
+                daily_json_path = output_dir / f"daily_news_{report.report_date}.json"
+                existing_daily = load_daily_report(daily_json_path)
+                existing_daily_items = existing_daily.items if existing_daily else []
+                output_paths.update(write_daily_outputs(output_dir, report, now, existing_daily))
             except Exception as exc:
                 logging.exception("Failed to merge or write daily cumulative report: %s", exc)
                 failed_report = build_failed_report(
@@ -1221,7 +1233,7 @@ def main() -> None:
                 output_paths.update(write_run_outputs(output_dir, failed_report))
                 report = failed_report
             else:
-                processed_items = select_processed_candidates(report, llm_candidates)
+                processed_items = select_processed_candidates(report, llm_candidates, existing_daily_items)
                 mark_processed(conn, processed_items)
 
         logging.info("Daily news assistant finished. Outputs: %s", output_paths)

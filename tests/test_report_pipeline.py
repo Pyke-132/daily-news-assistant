@@ -284,6 +284,103 @@ class ReportPipelineTests(unittest.TestCase):
 
         self.assertEqual(result, [selected])
 
+    def test_isolated_three_run_end_to_end_accumulates_daily_from_json(self):
+        candidate_a = candidate(title="News A", url="https://example.com/a", score=50)
+        candidate_b = candidate(title="News B", url="https://example.com/b?utm_source=first", score=40)
+        candidate_b_again = candidate(title="News B", url="https://www.example.com/b/?utm_source=second#section", score=40)
+        candidate_c = candidate(title="News C", url="https://example.com/c", score=30)
+        candidate_d = candidate(title="News D", url="https://example.com/d", score=20)
+
+        first_data = formal_report_dict(
+            items=[
+                item_dict(title="News A", url="https://example.com/a", score=9),
+                item_dict(title="News B", url="https://example.com/b?utm_source=first", score=8),
+            ]
+        )
+        first_data["candidate_count"] = 2
+        second_data = formal_report_dict(
+            items=[
+                item_dict(title="News B", url="https://www.example.com/b/?utm_source=second#section", score=8),
+                item_dict(title="News C", url="https://example.com/c", score=7),
+            ]
+        )
+        second_data["candidate_count"] = 2
+        third_data = formal_report_dict(items=[])
+        third_data["status"] = "low_value"
+        third_data["candidate_count"] = 1
+        third_data["low_value_reason"] = "Only optional references were found."
+        third_data["optional_references"] = [
+            item_dict(title="News D", url="https://example.com/d", score=4)
+        ]
+
+        first_report = main.validate_run_report(first_data, [candidate_a, candidate_b])
+        second_report = main.validate_run_report(second_data, [candidate_b_again, candidate_c])
+        third_report = main.validate_run_report(third_data, [candidate_d])
+
+        processed = []
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            run_times = [
+                main.datetime(2026, 6, 12, 9, 0, 0),
+                main.datetime(2026, 6, 12, 10, 0, 0),
+                main.datetime(2026, 6, 12, 11, 0, 0),
+            ]
+
+            for report, candidates, run_time in [
+                (first_report, [candidate_a, candidate_b], run_times[0]),
+                (second_report, [candidate_b_again, candidate_c], run_times[1]),
+                (third_report, [candidate_d], run_times[2]),
+            ]:
+                main.write_run_outputs(output_dir, report, run_time)
+                if report.status == "formal":
+                    daily_json_path = output_dir / f"daily_news_{report.report_date}.json"
+                    existing_daily = main.load_daily_report(daily_json_path)
+                    existing_items = existing_daily.items if existing_daily else []
+                    main.write_daily_outputs(output_dir, report, run_time, existing_daily)
+                    processed.extend(main.select_processed_candidates(report, candidates, existing_items))
+
+            latest_json = json.loads((output_dir / "latest_daily_news.json").read_text(encoding="utf-8"))
+            latest_md = (output_dir / "latest_daily_news.md").read_text(encoding="utf-8")
+            daily_json_path = output_dir / "daily_news_2026-06-12.json"
+            daily_md_path = output_dir / "daily_news_2026-06-12.md"
+            daily = main.load_daily_report(daily_json_path)
+            daily_md = daily_md_path.read_text(encoding="utf-8")
+            archive_jsons = sorted((output_dir / "archive").glob("daily_news_2026-06-12_*.json"))
+            archive_mds = sorted((output_dir / "archive").glob("daily_news_2026-06-12_*.md"))
+
+            self.assertEqual(latest_json["status"], "low_value")
+            self.assertEqual(latest_json["items"], [])
+            self.assertEqual(latest_json["optional_references"][0]["title"], "News D")
+            self.assertIn("今日无高价值新闻", latest_md)
+            self.assertIn("News D", latest_md)
+            self.assertNotIn("News D", daily_md)
+
+            self.assertEqual(len(archive_jsons), 3)
+            self.assertEqual(len(archive_mds), 3)
+            self.assertEqual([path.stem for path in archive_jsons], [path.stem for path in archive_mds])
+            for json_path, md_path in zip(archive_jsons, archive_mds):
+                archive_data = json.loads(json_path.read_text(encoding="utf-8"))
+                archive_md = md_path.read_text(encoding="utf-8")
+                self.assertIn(archive_data["status"], archive_md)
+
+            self.assertEqual([item.title for item in daily.items], ["News A", "News B", "News C"])
+            self.assertEqual(
+                [main.normalize_url_for_dedupe(item.url) for item in daily.items],
+                [
+                    main.normalize_url_for_dedupe("https://example.com/a"),
+                    main.normalize_url_for_dedupe("https://example.com/b?utm_source=first"),
+                    main.normalize_url_for_dedupe("https://example.com/c"),
+                ],
+            )
+            self.assertEqual(daily_md.count("## 1. News A"), 1)
+            self.assertEqual(daily_md.count("News B"), 1)
+            self.assertEqual(daily_md.count("News C"), 1)
+            for item in daily.items:
+                self.assertIn(item.title, daily_md)
+                self.assertIn(item.url, daily_md)
+
+            self.assertEqual([item.title for item in processed], ["News A", "News B", "News C"])
+
 
 if __name__ == "__main__":
     unittest.main()

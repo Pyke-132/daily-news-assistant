@@ -1,16 +1,32 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-
-# Local secrets and generated runtime files
+# Secrets
 .env
+.env.*
+!.env.example
+
+# Personal configuration
+config.yaml
+feedback.yaml
+
+# Databases
 news.db
+news.db-wal
+news.db-shm
+news_test.db
+*.sqlite
+*.sqlite3
+
+# Runtime outputs
 outputs/
+outputs_test/
 logs/
+
+# Backups
+manual_backups/
+backups/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage

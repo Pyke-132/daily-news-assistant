@@ -1,0 +1,14 @@
+likes:
+  topics:
+    - "RAG"
+  sources: []
+
+dislikes:
+  topics: []
+  sources: []
+
+learning_preferences:
+  - "先解释前置背景"
+  - "弱相关时明确说明"
+
+daily_feedback: []
